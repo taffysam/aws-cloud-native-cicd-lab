@@ -68,6 +68,17 @@ resource "aws_iam_role_policy" "github_ecs_deploy" {
         ]
         Resource = "*"
       },
+
+      {
+        Sid    = "InspectShippingAPITasks"
+        Effect = "Allow"
+        Action = [
+          "ecs:ListTasks",
+          "ecs:DescribeTasks"
+        ]
+        Resource = "*"
+      },
+
       {
         Sid    = "DeployShippingAPIService"
         Effect = "Allow"

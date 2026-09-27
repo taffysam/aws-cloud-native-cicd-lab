@@ -109,6 +109,17 @@ jobs:
           echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> "$GITHUB_ENV"
           echo "Registered task definition: $TASK_DEF_ARN"
 
+      - name: Capture previous ECS task definition
+        run: |
+          PREVIOUS_TASK_DEF=$(aws ecs describe-services \
+            --cluster shipping-api-dev \
+            --services shipping-api-dev \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          echo "PREVIOUS_TASK_DEF=$PREVIOUS_TASK_DEF" >> "$GITHUB_ENV"
+          echo "Previous task definition: $PREVIOUS_TASK_DEF"
+
       - name: Deploy new task definition to ECS
         run: |
           aws ecs update-service \
@@ -135,3 +146,96 @@ jobs:
           fi
 
           echo "ECS task definition verified successfully"
+
+      - name: Start ECS task for health verification
+        run: |
+          aws ecs update-service \
+            --cluster shipping-api-dev \
+            --service shipping-api-dev \
+            --desired-count 1
+
+          echo "VERIFICATION_TASK_STARTED=true" >> "$GITHUB_ENV"
+          echo "Started one ECS task for deployment verification"
+
+      - name: Wait for healthy ECS deployment
+        timeout-minutes: 10
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+
+          aws ecs wait services-stable \
+            --cluster shipping-api-dev \
+            --services shipping-api-dev
+
+          echo "Checking the running task..."
+
+          TASK_ARN=$(aws ecs list-tasks \
+            --cluster shipping-api-dev \
+            --service-name shipping-api-dev \
+            --desired-status RUNNING \
+            --query 'taskArns[0]' \
+            --output text)
+
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "ERROR: No running ECS task found"
+            exit 1
+          fi
+
+          TASK_STATUS=$(aws ecs describe-tasks \
+            --cluster shipping-api-dev \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].lastStatus' \
+            --output text)
+
+          TASK_HEALTH=$(aws ecs describe-tasks \
+            --cluster shipping-api-dev \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].healthStatus' \
+            --output text)
+
+          TASK_DEFINITION=$(aws ecs describe-tasks \
+            --cluster shipping-api-dev \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].taskDefinitionArn' \
+            --output text)
+
+          echo "Task status: $TASK_STATUS"
+          echo "Task health: $TASK_HEALTH"
+          echo "Task definition: $TASK_DEFINITION"
+
+          if [ "$TASK_STATUS" != "RUNNING" ] ||
+             [ "$TASK_HEALTH" != "HEALTHY" ] ||
+             [ "$TASK_DEFINITION" != "$TASK_DEF_ARN" ]; then
+            echo "ERROR: ECS deployment health verification failed"
+            exit 1
+          fi
+
+          echo "ECS deployment is running and healthy"
+
+      - name: Roll back failed ECS deployment
+        if: ${{ failure() && env.DEPLOYMENT_UPDATED == 'true' && env.PREVIOUS_TASK_DEF != '' }}
+        run: |
+          echo "Deployment failed. Restoring: $PREVIOUS_TASK_DEF"
+
+          aws ecs update-service \
+            --cluster shipping-api-dev \
+            --service shipping-api-dev \
+            --task-definition "$PREVIOUS_TASK_DEF" \
+            --desired-count 0
+
+          echo "Rollback requested"
+
+      - name: Stop ECS verification tasks
+        if: ${{ always() && env.PREVIOUS_TASK_DEF != '' }}
+        run: |
+          echo "Returning ECS service to zero tasks..."
+
+          aws ecs update-service \
+            --cluster shipping-api-dev \
+            --service shipping-api-dev \
+            --desired-count 0
+
+          aws ecs wait services-stable \
+            --cluster shipping-api-dev \
+            --services shipping-api-dev
+
+          echo "ECS service cleanup completed"
