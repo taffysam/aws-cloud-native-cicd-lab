@@ -10,6 +10,10 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: shipping-api-dev-deployment
+  cancel-in-progress: false
+
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: shipping-api
@@ -57,3 +61,75 @@ jobs:
           docker push "$IMAGE_URI"
 
           echo "Published image: $IMAGE_URI"
+
+      - name: Download current ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition shipping-api-dev \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Update task definition with new image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          jq --arg image "$IMAGE_URI" '
+            .containerDefinitions |= map(
+              if .name == "shipping-api"
+              then .image = $image
+              else .
+              end
+            )
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy,
+                .deregisteredAt,
+                .enableFaultInjection
+              )
+          ' task-definition.json > new-task-definition.json
+
+      - name: Register new ECS task definition
+        id: register-task
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> "$GITHUB_ENV"
+          echo "Registered task definition: $TASK_DEF_ARN"
+
+      - name: Deploy new task definition to ECS
+        run: |
+          aws ecs update-service \
+            --cluster shipping-api-dev \
+            --service shipping-api-dev \
+            --task-definition "$TASK_DEF_ARN"
+
+          echo "Updated ECS service to: $TASK_DEF_ARN"
+
+      - name: Verify ECS service task definition
+        run: |
+          DEPLOYED_TASK_DEF=$(aws ecs describe-services \
+            --cluster shipping-api-dev \
+            --services shipping-api-dev \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          echo "Expected: $TASK_DEF_ARN"
+          echo "Deployed: $DEPLOYED_TASK_DEF"
+
+          if [ "$DEPLOYED_TASK_DEF" != "$TASK_DEF_ARN" ]; then
+            echo "ERROR: ECS service is not using the expected task definition"
+            exit 1
+          fi
+
+          echo "ECS task definition verified successfully"
